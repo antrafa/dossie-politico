@@ -10,8 +10,30 @@ import json
 import html
 import re
 import datetime
+import webbrowser
+import argparse
 from pathlib import Path
 from typing import Dict, Any, List, Optional
+
+
+DEFAULT_PROFILE_IMAGE = (
+    "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 300 380'%3E"
+    "%3Crect width='300' height='380' fill='%231e293b'/%3E"
+    "%3Ccircle cx='150' cy='128' r='62' fill='%2364748b'/%3E"
+    "%3Cpath d='M48 338c8-78 50-120 102-120s94 42 102 120' fill='%2364748b'/%3E"
+    "%3C/svg%3E"
+)
+
+
+def safe_image_url(value: Any) -> str:
+    """Retorna a foto informada ou um fallback local sem dependência de rede."""
+    candidate = str(value or '').strip()
+    return candidate if candidate else DEFAULT_PROFILE_IMAGE
+
+
+def image_error_handler() -> str:
+    """Fallback de uma única execução, evitando laços de erro no navegador."""
+    return f"this.onerror=null;this.src='{DEFAULT_PROFILE_IMAGE}'"
 
 def sanitize_filename(name: str) -> str:
     cleaned = re.sub(r'[^\w\s-]', '', name).strip()
@@ -33,21 +55,258 @@ def get_badge_class(status: str) -> str:
     else:
         return "badge-info"
 
+
+def get_evidence_class(level: str) -> str:
+    """Mapeia a força da evidência sem converter a classificação em nota de caráter."""
+    normalized = (level or "").lower()
+    if any(term in normalized for term in ("confirmado", "documento", "decisão")):
+        return "evidence-confirmed"
+    if any(term in normalized for term in ("fortemente", "sustentado")):
+        return "evidence-supported"
+    if any(term in normalized for term in ("apuração", "investigação", "alegação oficial")):
+        return "evidence-pending"
+    if any(term in normalized for term in ("falso", "enganoso")):
+        return "evidence-false"
+    return "evidence-unproven"
+
+TRANSPARENCY_LABELS = {
+    'portal_transparencia_federal': '🔎 Portal da Transparência — busca geral',
+    'portal_transparencia_servidores': '👤 Transparência — remuneração de servidores',
+    'cgu_ceis_sancoes': '🚫 CGU/CEIS — empresas sancionadas',
+    'cnj_noticias_e_atos': '⚖️ CNJ — atos e notícias',
+    'stf_jurisprudencia': '🏛️ STF — jurisprudência',
+    'stj_jurisprudencia': '🏛️ STJ — jurisprudência',
+    'tse_divulgacand': '🗳️ TSE DivulgaCandContas',
+    'tcu_jurisprudencia_e_inabilitados': '📋 TCU — acórdãos e inabilitados',
+    'diario_oficial_uniao': '📰 Diário Oficial da União',
+}
+
+# Portais em single-page app não aceitam o termo pela URL: o leitor digita o nome.
+TRANSPARENCY_MANUAL = {'tse_divulgacand', 'tcu_jurisprudencia_e_inabilitados', 'diario_oficial_uniao'}
+
+
+def check_url(url: str, timeout: int = 10) -> str:
+    """Classifica um link de fonte sem afirmar mais do que a resposta HTTP permite."""
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 DossiePolitico/1.0'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return 'ok' if resp.status < 400 else f'indisponivel ({resp.status})'
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403, 429):
+            return f'nao verificavel ({exc.code})'
+        return f'quebrado ({exc.code})'
+    except Exception:
+        return 'nao verificado'
+
+
+def verify_sources(data: Dict[str, Any], workers: int = 8) -> Dict[str, int]:
+    """Marca cada fonte citada com o resultado da verificação. Link morto não é auditável."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    fontes = [
+        f
+        for caso in (data.get('controversias_e_noticias') or [])
+        if isinstance(caso, dict)
+        for f in (caso.get('fontes') or [])
+        if isinstance(f, dict) and str(f.get('url', '')).startswith('http')
+    ]
+    if not fontes:
+        return {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for fonte, status in zip(fontes, pool.map(lambda f: check_url(f['url']), fontes)):
+            fonte['status_link'] = status
+    tally: Dict[str, int] = {}
+    for fonte in fontes:
+        chave = fonte['status_link'].split(' (')[0]
+        tally[chave] = tally.get(chave, 0) + 1
+    return tally
+
+
+def open_index_file(index_path: str) -> bool:
+    """Abre o índice local no navegador padrão."""
+    try:
+        return bool(webbrowser.open(Path(index_path).resolve().as_uri(), new=2))
+    except Exception as exc:
+        print(f"[!] Não foi possível abrir o índice automaticamente: {exc}", file=sys.stderr)
+        return False
+
+def build_citizen_summary(data: Dict[str, Any]) -> Dict[str, str]:
+    """Normaliza o resumo cidadão e escapa todo conteúdo antes da renderização."""
+    raw = data.get('resumo_cidadao_ia') or {}
+    if isinstance(raw, str):
+        raw = {'sintese': raw}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    sintese = str(raw.get('sintese') or '').strip()
+    if not sintese:
+        sintese = (
+            "Este relatório ainda não contém uma síntese cidadã produzida por IA. "
+            "Consulte as seções detalhadas e as fontes oficiais vinculadas abaixo."
+        )
+    paragraphs = [p.strip() for p in re.split(r'\n\s*\n', sintese) if p.strip()]
+    summary_html = "".join(f"<p>{html.escape(p)}</p>" for p in paragraphs)
+
+    points_html = ""
+    for point in raw.get('pontos_chave') or []:
+        if isinstance(point, dict):
+            title = html.escape(str(point.get('titulo') or 'Ponto-chave'))
+            body = html.escape(str(point.get('texto') or ''))
+            points_html += f"<li><strong>{title}:</strong> {body}</li>"
+        else:
+            points_html += f"<li>{html.escape(str(point))}</li>"
+    if not points_html:
+        points_html = "<li>Consulte as seções detalhadas para formar sua própria conclusão.</li>"
+
+    gaps_html = "".join(
+        f"<li>{html.escape(str(gap))}</li>" for gap in (raw.get('lacunas') or [])
+    )
+    if not gaps_html:
+        gaps_html = "<li>Nenhuma lacuna material foi declarada no payload; isso não significa ausência de dados indisponíveis.</li>"
+
+    notice = html.escape(str(raw.get('aviso') or (
+        "Síntese gerada por IA a partir dos dados e fontes deste dossiê; "
+        "confira os links antes de formar sua conclusão."
+    )))
+    excerpt = re.sub(r'\s+', ' ', sintese).strip()
+    if len(excerpt) > 280:
+        excerpt = excerpt[:277].rstrip() + "..."
+
+    return {
+        'summary_html': summary_html,
+        'points_html': points_html,
+        'gaps_html': gaps_html,
+        'notice': notice,
+        'excerpt': excerpt,
+    }
+
+
+def build_summary_cases(cases: List[Dict[str, Any]]) -> str:
+    """Condensa todos os casos catalogados sem omitir estágio, limites ou defesa."""
+    if not cases:
+        return (
+            '<div class="summary-case-empty">Nenhum caso foi catalogado no recorte e nas fontes '
+            'consultadas; isso não prova inexistência de outros fatos.</div>'
+        )
+
+    rendered = []
+    for case in cases:
+        title = html.escape(str(case.get('titulo') or 'Fato catalogado'))
+        status = html.escape(str(case.get('status') or 'Status não informado'))
+        evidence = html.escape(str(case.get('grau_veracidade') or 'Não classificado'))
+        summary = html.escape(str(case.get('resumo') or 'Resumo não informado.'))
+        proven = html.escape(str(case.get('o_que_esta_comprovado') or 'Não informado.'))
+        unproven = html.escape(str(case.get('o_que_nao_esta_comprovado') or 'Não informado.'))
+        defense = html.escape(str(case.get('posicao_defesa') or (
+            'Manifestação da defesa não localizada no recorte pesquisado.'
+        )))
+        rendered.append(f"""
+            <details class="summary-case">
+                <summary>
+                    <span>{title}</span>
+                    <span class="summary-case-status">{status} • {evidence}</span>
+                </summary>
+                <p>{summary}</p>
+                <ul>
+                    <li><strong>Comprovado:</strong> {proven}</li>
+                    <li><strong>Não comprovado:</strong> {unproven}</li>
+                </ul>
+                <p class="summary-case-defense"><strong>Defesa / desfecho:</strong> {defense}</p>
+            </details>
+        """)
+    return ''.join(rendered)
+
 def generate_dossier_html(data: Dict[str, Any]) -> str:
     nome_eleitoral = html.escape(data.get('nome_eleitoral') or data.get('nome') or 'Político')
     nome_civil = html.escape(data.get('nome_civil') or nome_eleitoral)
     cargo = html.escape(data.get('cargo') or 'Agente Público')
     partido = html.escape(data.get('partido') or 'S/ Partido')
     uf = html.escape(data.get('uf') or 'BR')
-    foto_url = data.get('foto_url') or "https://via.placeholder.com/300x380?text=Sem+Foto"
-    salario_base = html.escape(str(data.get('salario_oficial_base') or 'R$ 44.008,52'))
+    foto_url = safe_image_url(data.get('foto_url'))
+    salario_base = html.escape(str(data.get('salario_oficial_base') or 'Não informado'))
     data_geracao = data.get('data_geracao') or datetime.datetime.now().strftime("%d/%m/%Y às %H:%M:%S")
+    data_corte = html.escape(str(data.get('data_corte') or 'Não informada'))
+    status_eleitoral = html.escape(str(data.get('status_eleitoral') or 'Não se aplica / não informado'))
+    situacao = html.escape(str(data.get('situacao') or 'Não informada'))
+    mandato_periodo = html.escape(str(data.get('mandato_periodo') or data.get('legislatura') or 'Não informado'))
+    municipio_nascimento = html.escape(str(data.get('municipio_nascimento') or 'Não informado'))
+    escolaridade = html.escape(str(data.get('escolaridade') or 'Não informada'))
+    telefone_gabinete = html.escape(str(data.get('telefone_gabinete') or 'Não informado'))
+    salario_contexto = html.escape(str(data.get('salario_contexto') or 'Consulte a fonte oficial do cargo e do período analisado'))
+    salario_label = html.escape(str(data.get('salario_label') or 'Salário Base Mensal'))
+    assiduidade_label = html.escape(str(data.get('assiduidade_label') or 'Assiduidade Parlamentar'))
+    assiduidade_contexto = html.escape(str(data.get('assiduidade_contexto') or 'Presença em sessões deliberativas'))
+    remuneration_section_title = html.escape(str(data.get('titulo_secao_remuneracao') or '💰 Remuneração, Cotas e Verbas Públicas'))
+    remuneration_description = html.escape(str(data.get('remuneracao_descricao') or (
+        'Além do subsídio mensal bruto, o mandato pode dispor de verbas operacionais e '
+        'indenizatórias regulamentadas pelo órgão competente.'
+    )))
+    activity_section_title = html.escape(str(data.get('titulo_secao_atuacao') or '📜 Atuação Legislativa e Principais Projetos'))
+    empty_controversies_note = html.escape(str(data.get('controversias_nota') or (
+        'Nenhuma investigação, processo ou controvérsia foi registrada no payload até a data de corte. '
+        'Isso descreve o conteúdo pesquisado e não prova a inexistência de outros fatos.'
+    )))
+    controversies_section_title = html.escape(str(data.get('titulo_secao_controversias') or (
+        '🚨 Escândalos, polêmicas e fatos verificados'
+    )))
+    citizen_summary = build_citizen_summary(data)
+    # Peso proporcional é exigência da ética da skill, mas nada avisava quando o dossiê pendia.
+    n_casos = len(data.get('controversias_e_noticias') or [])
+    n_atuacao = len(data.get('proposicoes_principais') or [])
+    proporcao_aviso = ""
+    if n_casos >= 3 and n_atuacao == 0:
+        proporcao_aviso = (
+            f"Este relatório reúne {n_casos} caso(s) de controvérsia e nenhum registro de atuação ou "
+            "proposição. A desproporção pode indicar lacuna da pesquisa, e não o retrato da pessoa: "
+            "complete a coleta de atividade pública antes de tratar o dossiê como equilibrado."
+        )
+    elif n_atuacao >= 5 and n_casos == 0:
+        proporcao_aviso = (
+            f"Este relatório reúne {n_atuacao} registro(s) de atuação e nenhum caso de controvérsia "
+            "no recorte pesquisado. Isso descreve o que foi encontrado, não comprova ausência de fatos."
+        )
+    proporcao_aviso_html = (
+        f'<p class="proportion-warning">⚖️ {html.escape(proporcao_aviso)}</p>' if proporcao_aviso else ''
+    )
+    coverage = data.get('cobertura_pesquisa') or {}
+
+    coverage_html = ""
+    if isinstance(coverage, dict) and coverage:
+        coverage_date = html.escape(str(coverage.get('data_execucao') or data.get('data_corte') or 'Não informada'))
+        coverage_period = html.escape(str(coverage.get('periodo') or 'Não informado'))
+
+        def coverage_list(label: str, key: str) -> str:
+            values = coverage.get(key) or []
+            if not isinstance(values, list):
+                values = [values]
+            clean_values = [html.escape(str(value)) for value in values if str(value).strip()]
+            if not clean_values:
+                return ""
+            return f"<li><strong>{label}:</strong> {'; '.join(clean_values)}</li>"
+
+        coverage_html = f"""
+            <details class="coverage-audit card">
+                <summary>Como esta busca foi feita</summary>
+                <p>Registro de cobertura para que o leitor conheça o alcance e os limites deste levantamento.</p>
+                <ul>
+                    <li><strong>Executada em:</strong> {coverage_date}</li>
+                    <li><strong>Período:</strong> {coverage_period}</li>
+                    {coverage_list('Nomes e vínculos consultados', 'nomes_consultados')}
+                    {coverage_list('Eixos verificados', 'eixos_verificados')}
+                    {coverage_list('Fontes e portais', 'fontes_consultadas')}
+                    {coverage_list('Limitações', 'limitacoes')}
+                </ul>
+            </details>
+        """
     
     # KPIs
-    assiduidade = html.escape(str(data.get('assiduidade_percentual') or '100% de Presença Institucional'))
+    assiduidade = html.escape(str(data.get('assiduidade_percentual') or 'Não informada'))
     props_total = len(data.get('proposicoes_principais', []))
     controversias = data.get('controversias_e_noticias', [])
     controversias_total = len(controversias)
+    summary_cases_html = build_summary_cases(controversias)
     patrimonio_recente = html.escape(str(data.get('patrimonio_declarado_recente') or 'Consultar TSE'))
     if patrimonio_recente == 'Consultar TSE' and data.get('evolucao_patrimonial'):
         patrimonio_recente = html.escape(str(data['evolucao_patrimonial'][0].get('valor_formatado') or 'Consultar TSE'))
@@ -73,6 +332,47 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
                 <div class="expense-detail">{detalhe}</div>
             </div>
             """
+
+    # Resumo agregado da cota parlamentar
+    despesas_resumo = data.get('despesas_resumo') or {}
+    despesas_resumo_html = ""
+    if isinstance(despesas_resumo, dict) and despesas_resumo.get('por_ano'):
+        anos_html = "".join(
+            f"<tr class='table-row'><td class='td-year'><strong>{html.escape(str(a.get('ano')))}</strong></td>"
+            f"<td class='td-value'>{html.escape(str(a.get('valor_formatado') or format_currency(a.get('valor'))))}</td></tr>"
+            for a in despesas_resumo['por_ano']
+        )
+        fornecedores_html = "".join(
+            "<li><strong>{nome}</strong> — {valor} em {notas} documento(s){doc}</li>".format(
+                nome=html.escape(str(f.get('nome') or 'Fornecedor não informado')),
+                valor=html.escape(str(f.get('valor_formatado') or format_currency(f.get('valor')))),
+                notas=html.escape(str(f.get('notas') or 0)),
+                doc=f" <span class='text-muted'>(CNPJ/CPF {html.escape(str(f.get('cnpj_cpf')))})</span>" if f.get('cnpj_cpf') else "",
+            )
+            for f in despesas_resumo.get('principais_fornecedores', [])
+        )
+        truncado = (
+            "<p class='text-muted'>Leitura interrompida no limite de páginas da API: o total mostrado é parcial.</p>"
+            if despesas_resumo.get('truncado') else ""
+        )
+        despesas_resumo_html = f"""
+            <div class="card">
+                <h3 class="card-title">🧾 Uso da cota parlamentar (CEAP)</h3>
+                <p style="margin-bottom: 14px; font-size: 0.92rem;">
+                    <strong>{html.escape(str(despesas_resumo.get('total_formatado') or format_currency(despesas_resumo.get('total'))))}</strong>
+                    reembolsados em {html.escape(str(despesas_resumo.get('registros_analisados') or 0))} documentos no período
+                    {html.escape(str(despesas_resumo.get('periodo') or 'não informado'))}, somados a partir das notas publicadas na
+                    API de Dados Abertos da Câmara. Valores reembolsados não indicam irregularidade por si.
+                </p>
+                {truncado}
+                <table class="data-table">
+                    <thead><tr><th>Ano</th><th>Total reembolsado</th></tr></thead>
+                    <tbody>{anos_html}</tbody>
+                </table>
+                <h3 class="card-title" style="margin-top: 18px;">Principais fornecedores</h3>
+                <ul class="styled-list">{fornecedores_html}</ul>
+            </div>
+        """
 
     # Redes sociais
     redes = data.get('redes_sociais', [])
@@ -101,8 +401,9 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
             ano = html.escape(str(p.get('ano', '')))
             ementa = html.escape(str(p.get('ementa', 'Sem ementa disponível.')))
             data_p = html.escape(str(p.get('data', '')))
-            status_tram = html.escape(str(p.get('status_tramitacao', 'Tramitação Ordinária')))
+            status_tram = html.escape(str(p.get('status_tramitacao') or 'Status não informado'))
             link_p = p.get('link') or "#"
+            link_label = html.escape(str(p.get('link_label') or 'Ver ficha de tramitação e texto integral'))
             props_html += f"""
             <div class="proposal-card">
                 <div class="proposal-header">
@@ -112,7 +413,7 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
                 </div>
                 <p class="proposal-ementa">{ementa}</p>
                 <div class="proposal-footer">
-                    <a href="{html.escape(link_p)}" target="_blank" rel="noopener" class="btn-link">Ver ficha de tramitação e texto integral ↗</a>
+                    <a href="{html.escape(link_p)}" target="_blank" rel="noopener" class="btn-link">{link_label} ↗</a>
                 </div>
             </div>
             """
@@ -125,26 +426,55 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
     if controversias:
         for idx, c in enumerate(controversias):
             titulo = html.escape(str(c.get('titulo', 'Fato Registrado')))
-            data_c = html.escape(str(c.get('data', 'Data recente')))
+            data_c = html.escape(str(c.get('data') or 'Data não informada'))
             tipo = str(c.get('categoria', 'Notícia / Investigação'))
             categories_set.add(tipo)
-            status = html.escape(str(c.get('status', 'Em Apuração')))
+            status = html.escape(str(c.get('status') or 'Status não classificado'))
             badge_cls = get_badge_class(status)
             resumo = html.escape(str(c.get('resumo', '')))
-            posicao_defesa = html.escape(str(c.get('posicao_defesa', 'Não houve manifestação oficial ou desfecho pendente.')))
+            posicao_defesa = html.escape(str(c.get('posicao_defesa') or 'Manifestação da defesa não localizada no recorte pesquisado.'))
+            evidence_level = html.escape(str(c.get('grau_veracidade') or 'Não classificado'))
+            evidence_class = get_evidence_class(str(c.get('grau_veracidade') or ''))
+            evidence_criteria = html.escape(str(c.get('criterio_veracidade') or (
+                'Classificação ainda não fundamentada no payload; consulte as fontes vinculadas.'
+            )))
+            proven = html.escape(str(c.get('o_que_esta_comprovado') or (
+                'Somente a existência das fontes e do estágio processual descrito foi documentada.'
+            )))
+            unproven = html.escape(str(c.get('o_que_nao_esta_comprovado') or (
+                'A responsabilidade pessoal e as alegações de mérito não devem ser presumidas.'
+            )))
             fontes = c.get('fontes', [])
             
             fontes_links = ""
             if isinstance(fontes, list):
                 for f in fontes:
-                    if isinstance(f, dict):
+                    if isinstance(f, dict) and not str(f.get('url') or '').startswith('http'):
+                        # Veículo e data sem URL: melhor declarar a lacuna do que citar link inventado.
+                        f_nome = html.escape(str(f.get('veiculo') or 'Fonte'))
+                        f_data = html.escape(str(f.get('data') or ''))
+                        sufixo = f" ({f_data})" if f_data else ""
+                        fontes_links += (
+                            f"<span class='source-tag source-nolink' title='URL não localizada; confira pelo "
+                            f"nome do veículo e pela data'>📄 {f_nome}{sufixo} — URL não localizada</span> "
+                        )
+                    elif isinstance(f, dict):
                         f_nome = html.escape(f.get('veiculo', 'Fonte'))
                         f_url = html.escape(f.get('url', '#'))
-                        fontes_links += f"<a href='{f_url}' target='_blank' rel='noopener' class='source-tag'>🔗 {f_nome}</a> "
+                        f_status = str(f.get('status_link') or '')
+                        if f_status.startswith('quebrado') or f_status.startswith('indisponivel'):
+                            mark, cls, hint = '⚠️', 'source-tag source-dead', f'Link não resolveu na verificação: {html.escape(f_status)}'
+                        elif f_status.startswith('nao verificavel'):
+                            mark, cls, hint = '🔒', 'source-tag', f'Site bloqueou a verificação automática: {html.escape(f_status)}'
+                        elif f_status == 'ok':
+                            mark, cls, hint = '🔗', 'source-tag', 'Link verificado na geração do dossiê'
+                        else:
+                            mark, cls, hint = '🔗', 'source-tag', 'Link não verificado automaticamente'
+                        fontes_links += f"<a href='{f_url}' target='_blank' rel='noopener' class='{cls}' title='{hint}'>{mark} {f_nome}</a> "
                     elif isinstance(f, str) and f.startswith('http'):
                         fontes_links += f"<a href='{html.escape(f)}' target='_blank' rel='noopener' class='source-tag'>🔗 Matéria Original</a> "
 
-            fallback_fontes = "<span class='text-muted'>Veículos jornalísticos nacionais (G1, Folha, Estadão, Poder360)</span>"
+            fallback_fontes = "<span class='text-muted'>Nenhuma fonte vinculada; verificação pendente.</span>"
             final_fontes = fontes_links if fontes_links else fallback_fontes
 
             cat_slug = re.sub(r'\W+', '_', tipo.lower())
@@ -157,12 +487,21 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
                         <div class="timeline-tags">
                             <span class="category-tag">{html.escape(tipo)}</span>
                             <span class="badge {badge_cls}">{status}</span>
+                            <span class="evidence-badge {evidence_class}">🔎 {evidence_level}</span>
                         </div>
                         <span class="timeline-date">📅 {data_c}</span>
                     </div>
                     <h3 class="timeline-title">{titulo}</h3>
                     <div class="timeline-text">
                         <p>{resumo}</p>
+                    </div>
+                    <div class="evidence-box">
+                        <strong>🔎 Grau de veracidade / força da evidência:</strong>
+                        <p>{evidence_criteria}</p>
+                        <ul>
+                            <li><strong>O que está comprovado:</strong> {proven}</li>
+                            <li><strong>O que não está comprovado:</strong> {unproven}</li>
+                        </ul>
                     </div>
                     <div class="defense-box">
                         <strong>⚖️ Posição da Defesa / Desfecho Jurídico:</strong>
@@ -175,9 +514,9 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
             </div>
             """
     else:
-        controversias_html = """
+        controversias_html = f"""
         <div class="empty-state card">
-            <p>Nenhuma investigação criminal, processo no STF ou escândalo notório com repercussão pública localizado até a data desta consulta.</p>
+            <p>{empty_controversies_note}</p>
         </div>
         """
 
@@ -197,7 +536,7 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
             cargo_disp = html.escape(str(p.get('cargo_disputado', '')))
             valor = html.escape(str(p.get('valor_formatado') or format_currency(p.get('valor', 0))))
             variacao = html.escape(str(p.get('variacao_percentual', '-')))
-            detalhe_bens = html.escape(str(p.get('principais_bens', 'Imóveis, veículos e participações societárias')))
+            detalhe_bens = html.escape(str(p.get('principais_bens') or 'Detalhamento não localizado'))
             patrimonio_html += f"""
             <tr class="table-row">
                 <td class="td-year"><strong>{ano_eleicao}</strong></td>
@@ -209,6 +548,127 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
             """
     else:
         patrimonio_html = "<tr><td colspan='5' class='text-muted text-center'>Consulte o portal TSE DivulgaCandContas para histórico eleitoral de bens.</td></tr>"
+
+    # Atuação institucional (coletada pelas APIs e antes descartada na renderização)
+    def _lista(items, render):
+        return "".join(render(i) for i in items if i)
+
+    comissoes = data.get('comissoes_orgaos') or []
+    comissoes_html = _lista(
+        [c for c in comissoes if isinstance(c, dict)],
+        lambda o: "<li><strong>{sigla}</strong> {nome} — {cargo}{desde}</li>".format(
+            sigla=html.escape(str(o.get('sigla') or '')),
+            nome=html.escape(str(o.get('nome') or '')),
+            cargo=html.escape(str(o.get('cargo') or 'Membro')),
+            desde=f" <span class='text-muted'>(desde {html.escape(str(o.get('data_inicio'))[:10])})</span>" if o.get('data_inicio') else "",
+        ),
+    )
+
+    frentes = data.get('frentes_destaque') or []
+    frentes_total = data.get('frentes_parlamentares_count')
+    frentes_html = _lista(frentes, lambda f: f"<li>{html.escape(str(f))}</li>")
+
+    discursos = data.get('discursos_recentes') or []
+    discursos_html = _lista(
+        [d for d in discursos if isinstance(d, dict)],
+        lambda d: "<li><strong>{dt}</strong> — {sumario}</li>".format(
+            dt=html.escape(str(d.get('data_hora') or '')[:10]),
+            sumario=html.escape(str(d.get('sumario') or d.get('fase') or 'Sem sumário registrado')),
+        ),
+    )
+
+    suplentes = data.get('suplentes') or []
+    suplentes_html = _lista(
+        [x for x in suplentes if isinstance(x, dict)],
+        lambda x: f"<li>{html.escape(str(x.get('participacao') or 'Suplente'))}: {html.escape(str(x.get('nome') or 'Não informado'))}</li>",
+    )
+
+    institucional_blocos = ""
+    if comissoes_html:
+        institucional_blocos += f"<div class='card'><h3 class='card-title'>🏛️ Comissões e órgãos</h3><ul class='styled-list'>{comissoes_html}</ul></div>"
+    if frentes_html:
+        total_txt = f" ({frentes_total} no total)" if frentes_total else ""
+        institucional_blocos += f"<div class='card'><h3 class='card-title'>🤝 Frentes parlamentares{html.escape(total_txt)}</h3><ul class='styled-list'>{frentes_html}</ul></div>"
+    if suplentes_html:
+        institucional_blocos += f"<div class='card'><h3 class='card-title'>👥 Suplentes do mandato</h3><ul class='styled-list'>{suplentes_html}</ul></div>"
+    if discursos_html:
+        institucional_blocos += f"<div class='card'><h3 class='card-title'>🎙️ Discursos recentes em plenário</h3><ul class='styled-list'>{discursos_html}</ul></div>"
+
+    institucional_html = ""
+    if institucional_blocos:
+        institucional_html = f"""
+        <section>
+            <h2 class="section-title">🏛️ Atuação institucional</h2>
+            <div class="proposals-grid">{institucional_blocos}</div>
+        </section>
+        """
+
+    # Links de transparência para conferência independente
+    links_transp = data.get('links_transparencia') or {}
+    transparencia_html = ""
+    if isinstance(links_transp, dict):
+        transparencia_html = "".join(
+            f"<a href='{html.escape(str(url))}' target='_blank' rel='noopener' class='btn-link'>"
+            f"{html.escape(TRANSPARENCY_LABELS.get(key, key.replace('_', ' ').capitalize()))}"
+            f"{' (digite o nome)' if key in TRANSPARENCY_MANUAL else ''} ↗</a>"
+            for key, url in links_transp.items()
+            if isinstance(url, str) and url.startswith('http')
+        )
+    if transparencia_html:
+        transparencia_html = f"""
+        <section>
+            <h2 class="section-title">🔎 Onde conferir por conta própria</h2>
+            <div class="card">
+                <p style="margin-bottom: 14px; font-size: 0.92rem;">
+                    Buscas abertas nos portais oficiais. São pontos de partida de consulta pública, não resultados já apurados
+                    neste dossiê. Onde aparece “(digite o nome)”, o portal não aceita o termo pela URL: pesquise por
+                    <strong>{nome_eleitoral}</strong> ou <strong>{nome_civil}</strong>.
+                </p>
+                <div style="display: flex; gap: 14px; flex-wrap: wrap;">{transparencia_html}</div>
+            </div>
+        </section>
+        """
+
+    # Identificação complementar
+    email_contato = html.escape(str(data.get('email') or 'Não informado'))
+    data_nascimento = html.escape(str(data.get('data_nascimento') or 'Não informada'))
+    gabinete_sala = html.escape(str(data.get('sala_gabinete') or ''))
+    bloco_parlamentar = html.escape(str(data.get('bloco_parlamentar') or ''))
+    bio_extra_html = f"""
+                    <div class="bio-item">
+                        <span class="bio-label">Nascimento</span>
+                        <span class="bio-val">{data_nascimento}</span>
+                    </div>
+                    <div class="bio-item">
+                        <span class="bio-label">E-mail institucional</span>
+                        <span class="bio-val">{email_contato}</span>
+                    </div>"""
+    if bloco_parlamentar:
+        bio_extra_html += f"""
+                    <div class="bio-item">
+                        <span class="bio-label">Bloco / Liderança</span>
+                        <span class="bio-val">{bloco_parlamentar}</span>
+                    </div>"""
+    if gabinete_sala:
+        bio_extra_html += f"""
+                    <div class="bio-item">
+                        <span class="bio-label">Endereço do gabinete</span>
+                        <span class="bio-val">{gabinete_sala}</span>
+                    </div>"""
+
+    revisoes = [r for r in (data.get('revisoes_anteriores') or []) if r]
+    revisoes_html = (
+        "<p><strong>Revisões anteriores deste relatório:</strong> "
+        + html.escape("; ".join(str(r) for r in revisoes[-6:]))
+        + ". O conteúdo é reescrito a cada geração; compare com a data de corte antes de citar.</p>"
+        if revisoes else ""
+    )
+
+    link_votacoes = data.get('link_votacoes')
+    votacoes_link_html = (
+        f'<a href="{html.escape(str(link_votacoes))}" target="_blank" rel="noopener">🗳️ Histórico de votações</a>'
+        if isinstance(link_votacoes, str) and link_votacoes.startswith('http') else ''
+    )
 
     # Links oficiais
     link_perfil = data.get('link_perfil_oficial') or "https://www.camara.leg.br"
@@ -491,6 +951,157 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
         .bio-val {{
             font-weight: 700;
             color: var(--text-main);
+        }}
+
+        /* Resumo cidadão */
+        .citizen-summary {{
+            margin: 24px 0;
+            border: 1px solid var(--accent);
+            background: var(--bg-card);
+            border-radius: var(--radius);
+            padding: 28px;
+            box-shadow: var(--shadow);
+        }}
+
+        .summary-heading {{
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            gap: 16px;
+            flex-wrap: wrap;
+            margin-bottom: 16px;
+        }}
+
+        .summary-heading h2 {{
+            font-size: 1.45rem;
+            line-height: 1.25;
+        }}
+
+        .ai-label {{
+            background: var(--accent-glow);
+            color: var(--accent);
+            border: 1px solid var(--accent);
+            border-radius: 999px;
+            padding: 4px 10px;
+            font-size: 0.72rem;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.45px;
+        }}
+
+        .summary-copy p {{
+            margin-bottom: 12px;
+            font-size: 0.96rem;
+        }}
+
+        .summary-facts {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 10px;
+            margin: 18px 0;
+        }}
+
+        .summary-fact {{
+            background: var(--bg-card-alt);
+            border: 1px solid var(--border-color);
+            border-radius: 9px;
+            padding: 12px;
+        }}
+
+        .summary-fact span {{
+            display: block;
+            color: var(--text-muted);
+            font-size: 0.7rem;
+            font-weight: 800;
+            letter-spacing: 0.45px;
+            text-transform: uppercase;
+        }}
+
+        .summary-fact strong {{ font-size: 0.9rem; }}
+
+        .summary-cases {{
+            margin-top: 20px;
+            border-top: 1px solid var(--border-color);
+            padding-top: 18px;
+        }}
+
+        .summary-cases h3 {{
+            color: var(--accent);
+            font-size: 0.9rem;
+            text-transform: uppercase;
+            letter-spacing: 0.45px;
+            margin-bottom: 10px;
+        }}
+
+        .summary-case {{
+            background: var(--bg-card-alt);
+            border: 1px solid var(--border-color);
+            border-radius: 9px;
+            margin-bottom: 9px;
+            padding: 12px 14px;
+        }}
+
+        .summary-case summary {{
+            cursor: pointer;
+            display: flex;
+            justify-content: space-between;
+            gap: 12px;
+            font-weight: 800;
+        }}
+
+        .summary-case-status {{
+            color: var(--text-muted);
+            font-size: 0.74rem;
+            font-weight: 700;
+            text-align: right;
+        }}
+
+        .summary-case p {{ margin: 10px 0 6px; font-size: 0.86rem; }}
+        .summary-case ul {{ margin-left: 20px; color: var(--text-muted); font-size: 0.82rem; }}
+        .summary-case-defense {{ color: var(--text-muted); }}
+        .summary-case-empty {{ color: var(--text-muted); font-size: 0.88rem; }}
+
+        .summary-grid {{
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 18px;
+            margin-top: 20px;
+        }}
+
+        .summary-panel {{
+            background: var(--bg-card-alt);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 18px;
+        }}
+
+        .summary-panel h3 {{
+            color: var(--accent);
+            font-size: 0.86rem;
+            text-transform: uppercase;
+            letter-spacing: 0.45px;
+            margin-bottom: 10px;
+        }}
+
+        .summary-panel ul {{
+            padding-left: 20px;
+        }}
+
+        .summary-panel li {{
+            margin-bottom: 8px;
+            font-size: 0.88rem;
+        }}
+
+        .ai-notice {{
+            margin-top: 18px;
+            padding-top: 14px;
+            border-top: 1px solid var(--border-color);
+            color: var(--text-muted);
+            font-size: 0.8rem;
+        }}
+
+        @media (max-width: 768px) {{
+            .summary-grid {{ grid-template-columns: 1fr; }}
         }}
 
         /* KPI Dashboard Grid */
@@ -805,6 +1416,49 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
             line-height: 1.55;
         }}
 
+        .evidence-badge {{
+            display: inline-flex;
+            align-items: center;
+            border-radius: 999px;
+            border: 1px solid;
+            padding: 4px 9px;
+            font-size: 0.72rem;
+            font-weight: 800;
+        }}
+
+        .evidence-confirmed {{ color: #86efac; border-color: #22c55e; background: rgba(34, 197, 94, 0.14); }}
+        .evidence-supported {{ color: #93c5fd; border-color: #3b82f6; background: rgba(59, 130, 246, 0.14); }}
+        .evidence-pending {{ color: #fde047; border-color: #f59e0b; background: rgba(245, 158, 11, 0.14); }}
+        .evidence-unproven {{ color: #cbd5e1; border-color: #64748b; background: rgba(100, 116, 139, 0.14); }}
+        .evidence-false {{ color: #fca5a5; border-color: #ef4444; background: rgba(239, 68, 68, 0.14); }}
+
+        .evidence-box {{
+            margin-top: 14px;
+            padding: 14px 16px;
+            border: 1px solid var(--info-border);
+            border-radius: 10px;
+            background: var(--info-bg);
+            color: var(--text-main);
+        }}
+
+        .evidence-box p {{ margin: 7px 0; }}
+        .evidence-box ul {{ margin-left: 20px; color: var(--text-muted); }}
+
+        .coverage-audit {{
+            margin: 12px 0 18px;
+            padding: 16px 18px;
+            color: var(--text-muted);
+        }}
+
+        .coverage-audit summary {{
+            color: var(--text-main);
+            cursor: pointer;
+            font-weight: 800;
+        }}
+
+        .coverage-audit p {{ margin: 10px 0 6px; }}
+        .coverage-audit ul {{ margin-left: 20px; }}
+
         .defense-box {{
             background: var(--bg-card-alt);
             border-left: 4px solid var(--accent);
@@ -847,6 +1501,60 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
         }}
         .source-tag:hover {{
             text-decoration: underline;
+        }}
+        /* Despesas discriminadas */
+        .expenses-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+            gap: 14px;
+            margin-top: 16px;
+        }}
+        .expense-card {{
+            background: var(--bg-card);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 14px 16px;
+        }}
+        .expense-header {{
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            gap: 10px;
+            margin-bottom: 6px;
+        }}
+        .expense-category {{
+            font-size: 0.78rem;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.03em;
+            color: var(--text-muted);
+        }}
+        .expense-value {{
+            font-size: 1rem;
+            font-weight: 800;
+            color: var(--accent);
+            white-space: nowrap;
+        }}
+        .expense-detail {{
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }}
+        .proportion-warning {{
+            margin-top: 14px;
+            padding: 12px 14px;
+            border-left: 4px solid var(--warning-border);
+            background: var(--warning-bg);
+            color: var(--warning-text);
+            border-radius: 6px;
+            font-size: 0.9rem;
+        }}
+        .source-nolink {{
+            color: var(--text-muted);
+            font-weight: 600;
+        }}
+        .source-dead {{
+            color: var(--text-muted);
+            text-decoration: line-through;
         }}
 
         /* Badges */
@@ -992,12 +1700,12 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
 
         <!-- Perfil Hero -->
         <section class="hero-section">
-            <img src="{foto_url}" alt="Foto de {nome_eleitoral}" class="profile-photo" onerror="this.src='https://via.placeholder.com/300x380?text=Foto+Indisponivel'">
+            <img src="{html.escape(foto_url)}" alt="Foto de {nome_eleitoral}" class="profile-photo" onerror="{image_error_handler()}">
             <div class="profile-info">
                 <div class="hero-tags">
                     <span class="tag-party">{partido}</span>
                     <span class="tag-role">{cargo} • {uf}</span>
-                    <span class="badge badge-info">{data.get('situacao', 'Em Exercício')}</span>
+                    <span class="badge badge-info">{situacao}</span>
                 </div>
                 <h1 class="profile-name">{nome_eleitoral}</h1>
                 <p class="profile-civil-name">Nome Civil: <strong>{nome_civil}</strong></p>
@@ -1005,20 +1713,21 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
                 <div class="quick-bio">
                     <div class="bio-item">
                         <span class="bio-label">Mandato / Legislatura</span>
-                        <span class="bio-val">{data.get('mandato_periodo') or f"Legislatura {data.get('legislatura', 57)}"}</span>
+                        <span class="bio-val">{mandato_periodo}</span>
                     </div>
                     <div class="bio-item">
                         <span class="bio-label">Naturalidade</span>
-                        <span class="bio-val">{data.get('municipio_nascimento') or 'Brasil'}</span>
+                        <span class="bio-val">{municipio_nascimento}</span>
                     </div>
                     <div class="bio-item">
                         <span class="bio-label">Escolaridade</span>
-                        <span class="bio-val">{data.get('escolaridade') or 'Superior Completo'}</span>
+                        <span class="bio-val">{escolaridade}</span>
                     </div>
                     <div class="bio-item">
                         <span class="bio-label">Gabinete / Contato</span>
-                        <span class="bio-val">{data.get('telefone_gabinete') or 'Gabinete Oficial'}</span>
+                        <span class="bio-val">{telefone_gabinete}</span>
                     </div>
+                    {bio_extra_html}
                 </div>
 
                 <div style="margin-top: 10px;">
@@ -1028,17 +1737,54 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
             </div>
         </section>
 
+        <!-- Resumo cidadão gerado por IA -->
+        <section class="citizen-summary" aria-labelledby="resumo-cidadao-title">
+            <div class="summary-heading">
+                <div>
+                    <span class="bio-label">Raio-X consolidado • data de corte: {data_corte}</span>
+                    <h2 id="resumo-cidadao-title">Raio-X do candidato: consolidado por IA</h2>
+                </div>
+                <span class="ai-label">Síntese por IA</span>
+            </div>
+            <div class="summary-copy">
+                {citizen_summary['summary_html']}
+            </div>
+            <div class="summary-facts">
+                <div class="summary-fact"><span>Status eleitoral</span><strong>{status_eleitoral}</strong></div>
+                <div class="summary-fact"><span>Remuneração</span><strong>{salario_base.split('(')[0].strip()}</strong></div>
+                <div class="summary-fact"><span>Patrimônio declarado</span><strong>{patrimonio_recente.split('/')[0].strip()}</strong></div>
+                <div class="summary-fact"><span>Atuação / propostas</span><strong>{props_total} itens</strong></div>
+                <div class="summary-fact"><span>Polêmicas e processos</span><strong>{controversias_total} casos</strong></div>
+            </div>
+            <div class="summary-cases">
+                <h3>Escândalos, polêmicas e processos — todos os casos catalogados</h3>
+                {summary_cases_html}
+            </div>
+            <div class="summary-grid">
+                <div class="summary-panel">
+                    <h3>Pontos-chave</h3>
+                    <ul>{citizen_summary['points_html']}</ul>
+                </div>
+                <div class="summary-panel">
+                    {proporcao_aviso_html}
+                <h3>Lacunas e limites</h3>
+                    <ul>{citizen_summary['gaps_html']}</ul>
+                </div>
+            </div>
+            <p class="ai-notice"><strong>Status eleitoral:</strong> {status_eleitoral}<br>{citizen_summary['notice']}</p>
+        </section>
+
         <!-- KPI Dashboard -->
         <section class="kpi-grid">
             <div class="kpi-card">
-                <div class="kpi-title">Salário Base Mensal</div>
+                <div class="kpi-title">{salario_label}</div>
                 <div class="kpi-value">{salario_base.split('(')[0].strip()}</div>
-                <div class="kpi-subtext">Valor bruto fixado no Decreto Leg. 172/2022</div>
+                <div class="kpi-subtext">{salario_contexto}</div>
             </div>
             <div class="kpi-card">
-                <div class="kpi-title">Assiduidade Parlamentar</div>
-                <div class="kpi-value">{assiduidade.split(' ')[0]}</div>
-                <div class="kpi-subtext">Presença em sessões deliberativas</div>
+                <div class="kpi-title">{assiduidade_label}</div>
+                <div class="kpi-value">{assiduidade}</div>
+                <div class="kpi-subtext">{assiduidade_contexto}</div>
             </div>
             <div class="kpi-card">
                 <div class="kpi-title">Patrimônio Declarado (TSE)</div>
@@ -1046,19 +1792,19 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
                 <div class="kpi-subtext">Declaração oficial no DivulgaCandContas</div>
             </div>
             <div class="kpi-card">
-                <div class="kpi-title">Investigações & Notícias</div>
+                <div class="kpi-title">Polêmicas & Processos</div>
                 <div class="kpi-value">{controversias_total} Casos</div>
-                <div class="kpi-subtext">Fatos públicos catalogados com contraditório</div>
+                <div class="kpi-subtext">Fatos com fontes, contraditório e força da evidência</div>
             </div>
         </section>
 
         <!-- Remuneração e Verbas -->
         <section>
-            <h2 class="section-title">💰 Remuneração, Cotas e Verbas Públicas</h2>
+            <h2 class="section-title">{remuneration_section_title}</h2>
             <div class="card">
                 <h3 class="card-title">💵 Estrutura Remuneratória e Benefícios Oficiais</h3>
                 <p style="margin-bottom: 14px; font-size: 0.92rem;">
-                    Remuneração oficial base: <strong>{salario_base}</strong>. Além do subsídio mensal bruto, o mandato dispõe de verbas operacionais e indenizatórias regulamentadas pela Mesa Diretora:
+                    Remuneração oficial base: <strong>{salario_base}</strong>. {remuneration_description}
                 </p>
                 <ul class="styled-list">
                     {auxilios_html}
@@ -1068,15 +1814,19 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
                     <a href="{link_presenca}" target="_blank" rel="noopener" class="btn-link">📋 Consultar diário de presença em plenário ↗</a>
                 </div>
             </div>
+            {despesas_resumo_html}
+            <div class="expenses-grid">{gastos_html}</div>
         </section>
 
         <!-- Atuação Legislativa -->
         <section>
-            <h2 class="section-title">📜 Atuação Legislativa e Principais Projetos</h2>
+            <h2 class="section-title">{activity_section_title}</h2>
             <div class="proposals-grid">
                 {props_html}
             </div>
         </section>
+
+        {institucional_html}
 
         <!-- Evolução Patrimonial -->
         <section>
@@ -1101,10 +1851,15 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
 
         <!-- Notícias, Investigações e Escândalos -->
         <section>
-            <h2 class="section-title">⚖️ Dossiê de Notícias, Investigações, Processos e Escândalos</h2>
+            <h2 class="section-title">{controversies_section_title}</h2>
             <p style="color: var(--text-muted); font-size: 0.9rem; margin-bottom: 16px;">
-                Levantamento cronológico de operações policiais, inquéritos do Ministério Público, processos no STF/STJ, representações éticas e matérias jornalísticas de interesse público com links e posicionamento obrigatório da defesa.
+                Levantamento cronológico de fatos de interesse público, com estágio atual, contraditório e força da evidência. “Escândalo” ou “polêmica” descreve a repercussão pública e não presume culpa.
             </p>
+            <div class="evidence-legend card">
+                <strong>Como ler o grau de veracidade:</strong>
+                <p><b>Confirmado por documento/decisão</b> comprova o evento descrito, não necessariamente a acusação de mérito. <b>Fortemente sustentado</b> reúne fontes independentes convergentes. <b>Alegação oficial em apuração</b> confirma que existe investigação ou acusação, mas não culpa. <b>Contestado / não comprovado</b> não possui base suficiente. <b>Falso ou enganoso</b> exige checagem documental explícita.</p>
+            </div>
+            {coverage_html}
             
             <div class="filter-bar">
                 {filter_buttons_html}
@@ -1115,14 +1870,18 @@ def generate_dossier_html(data: Dict[str, Any]) -> str:
             </div>
         </section>
 
+        {transparencia_html}
+
         <!-- Fontes e Trilha de Auditoria -->
         <footer class="footer">
+            {revisoes_html}
             <p><strong>Dossiê gerado em:</strong> {data_geracao} | Metodologia: Auditoria em APIs de Dados Abertos, Diários Oficiais e Veículos Jornalísticos Auditáveis.</p>
             <div class="audit-links">
                 <a href="index.html">📋 Índice Geral</a>
                 <a href="{link_perfil}" target="_blank" rel="noopener">🏛️ Portal Oficial do Mandato</a>
                 <a href="{link_gastos}" target="_blank" rel="noopener">💸 Portal da Transparência de Gastos</a>
                 <a href="{link_tse}" target="_blank" rel="noopener">🗳️ TSE DivulgaCandContas</a>
+                {votacoes_link_html}
                 <a href="https://portaldatransparencia.gov.br" target="_blank" rel="noopener">🔎 Portal da Transparência CGU</a>
             </div>
         </footer>
@@ -1177,18 +1936,20 @@ def generate_index_html(entries: List[Dict[str, Any]]) -> str:
         cargo = html.escape(e.get('cargo', 'Agente Público'))
         partido = html.escape(e.get('partido', 'S/ Partido'))
         uf = html.escape(e.get('uf', 'BR'))
-        foto_url = e.get('foto_url') or "https://via.placeholder.com/300x380?text=Sem+Foto"
-        salario = html.escape(str(e.get('salario_base', 'R$ 44.008,52')).split('(')[0].strip())
+        foto_url = safe_image_url(e.get('foto_url'))
+        salario = html.escape(str(e.get('salario_base') or 'Não informado').split('(')[0].strip())
         patrimonio = html.escape(str(e.get('patrimonio_recente', 'Consultar TSE')).split('/')[0].strip())
         filename = html.escape(e.get('filename', '#'))
         props_c = e.get('proposicoes_total', 0)
         contr_c = e.get('controversias_total', 0)
+        itens_label = html.escape(str(e.get('itens_label') or 'Propostas'))
         data_analise = html.escape(e.get('data_atualizacao', 'Recente'))
+        resumo_curto = html.escape(str(e.get('resumo_curto') or 'Abra o relatório para consultar o panorama cidadão.'))
         
         cards_html += f"""
         <div class="politician-card" data-search="{nome_eleitoral.lower()} {nome_civil.lower()} {partido.lower()} {uf.lower()} {cargo.lower()}">
             <div class="card-hero">
-                <img src="{foto_url}" alt="{nome_eleitoral}" class="card-avatar" onerror="this.src='https://via.placeholder.com/120x150?text=Foto'">
+                <img src="{html.escape(foto_url)}" alt="{nome_eleitoral}" class="card-avatar" onerror="{image_error_handler()}">
                 <div class="card-header-info">
                     <div class="card-tags">
                         <span class="tag-party">{partido}</span>
@@ -1199,6 +1960,7 @@ def generate_index_html(entries: List[Dict[str, Any]]) -> str:
                 </div>
             </div>
             <div class="card-body">
+                <p class="card-summary">{resumo_curto}</p>
                 <div class="card-metric-row">
                     <div class="card-metric">
                         <span class="metric-label">Salário Base</span>
@@ -1210,8 +1972,8 @@ def generate_index_html(entries: List[Dict[str, Any]]) -> str:
                     </div>
                 </div>
                 <div class="card-stats-row">
-                    <span class="stat-pill">📜 {props_c} Propostas</span>
-                    <span class="stat-pill">⚖️ {contr_c} Notícias/Casos</span>
+                    <span class="stat-pill">📜 {props_c} {itens_label}</span>
+                    <span class="stat-pill">⚖️ {contr_c} Polêmicas/Casos</span>
                 </div>
             </div>
             <div class="card-footer">
@@ -1521,6 +2283,14 @@ def generate_index_html(entries: List[Dict[str, Any]]) -> str:
             gap: 12px;
         }}
 
+        .card-summary {{
+            color: var(--text-muted);
+            font-size: 0.82rem;
+            line-height: 1.45;
+            padding-bottom: 12px;
+            border-bottom: 1px solid var(--border-color);
+        }}
+
         .card-metric-row {{
             display: flex;
             justify-content: space-between;
@@ -1636,7 +2406,7 @@ def generate_index_html(entries: List[Dict[str, Any]]) -> str:
             </div>
             <div class="stat-box">
                 <div class="stat-num">{total_propostas}</div>
-                <div class="stat-desc">Proposições & Leis Monitoradas</div>
+                <div class="stat-desc">Itens Públicos Catalogados</div>
             </div>
             <div class="stat-box">
                 <div class="stat-num">{total_controversias}</div>
@@ -1716,11 +2486,14 @@ def update_index_catalog(output_dir: str, data: Dict[str, Any], filename: str):
         'partido': data.get('partido', 'S/ Partido'),
         'uf': data.get('uf', 'BR'),
         'foto_url': data.get('foto_url', ''),
-        'salario_base': data.get('salario_oficial_base', 'R$ 44.008,52'),
+        'salario_base': data.get('salario_oficial_base', 'Não informado'),
         'patrimonio_recente': patrimonio,
         'proposicoes_total': len(data.get('proposicoes_principais', [])),
         'controversias_total': len(data.get('controversias_e_noticias', [])),
+        'itens_label': data.get('itens_label', 'Propostas'),
+        'resumo_curto': build_citizen_summary(data)['excerpt'],
         'filename': filename,
+        'revisoes': [d for d in (data.get('revisoes_anteriores') or []) if d],
         'data_atualizacao': datetime.datetime.now().strftime("%d/%m/%Y às %H:%M")
     }
 
@@ -1740,7 +2513,97 @@ def update_index_catalog(output_dir: str, data: Dict[str, Any], filename: str):
     with open(index_html_path, 'w', encoding='utf-8') as f:
         f.write(index_html_content)
 
-def build_dossier_file(data: Dict[str, Any], output_dir: Optional[str] = None) -> str:
+
+def remove_dossier_entry(output_dir: str, filename: str, delete_html: bool = False) -> bool:
+    """Remove uma entrada exata do catálogo e, opcionalmente, seu HTML individual."""
+    if os.path.basename(filename) != filename:
+        raise ValueError("O nome do arquivo não pode conter diretórios.")
+
+    index_json_path = os.path.join(output_dir, "index.json")
+    index_html_path = os.path.join(output_dir, "index.html")
+    entries: List[Dict[str, Any]] = []
+    if os.path.exists(index_json_path):
+        with open(index_json_path, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+            if isinstance(loaded, list):
+                entries = loaded
+
+    filtered = [entry for entry in entries if entry.get('filename') != filename]
+    removed = len(filtered) != len(entries)
+    if not removed:
+        return False
+
+    with open(index_json_path, 'w', encoding='utf-8') as f:
+        json.dump(filtered, f, indent=2, ensure_ascii=False)
+    with open(index_html_path, 'w', encoding='utf-8') as f:
+        f.write(generate_index_html(filtered))
+
+    if delete_html:
+        dossier_path = Path(output_dir, filename)
+        if dossier_path.is_file():
+            dossier_path.unlink()
+    return True
+
+def validate_coverage_record(data: Dict[str, Any]) -> None:
+    """Impede que um dossiê seja entregue sem auditoria mínima de cobertura."""
+    coverage = data.get('cobertura_pesquisa')
+    if not isinstance(coverage, dict):
+        raise ValueError(
+            "Dossiê incompleto: informe 'cobertura_pesquisa' após executar a auditoria "
+            "mínima descrita em references/sources-guide.md."
+        )
+
+    missing_scalars = [
+        key for key in ('data_execucao', 'periodo')
+        if not str(coverage.get(key) or '').strip()
+    ]
+    missing_lists = [
+        key for key in ('nomes_consultados', 'eixos_verificados', 'fontes_consultadas')
+        if not isinstance(coverage.get(key), list) or not coverage.get(key)
+    ]
+    if 'limitacoes' not in coverage or not isinstance(coverage.get('limitacoes'), list):
+        missing_lists.append('limitacoes')
+
+    missing = missing_scalars + missing_lists
+    if missing:
+        raise ValueError(
+            "Dossiê incompleto: o registro 'cobertura_pesquisa' precisa preencher: "
+            + ", ".join(missing)
+            + "."
+        )
+
+
+def read_previous_revisions(output_dir: str, filename: str) -> List[str]:
+    """Datas das gerações anteriores deste mesmo relatório, para o leitor saber que houve revisão."""
+    index_json_path = os.path.join(output_dir, "index.json")
+    if not os.path.exists(index_json_path):
+        return []
+    try:
+        with open(index_json_path, 'r', encoding='utf-8') as f:
+            entries = json.load(f)
+    except Exception:
+        return []
+    for entry in entries if isinstance(entries, list) else []:
+        if entry.get('filename') == filename:
+            anteriores = [d for d in (entry.get('revisoes') or []) if d]
+            atual = entry.get('data_atualizacao')
+            return (anteriores + [atual]) if atual else anteriores
+    return []
+
+
+def build_dossier_file(data: Dict[str, Any], output_dir: Optional[str] = None,
+                       check_links: bool = True) -> str:
+    validate_coverage_record(data)
+    if check_links:
+        tally = verify_sources(data)
+        if tally:
+            resumo = ", ".join(f"{qtd} {nome}" for nome, qtd in sorted(tally.items()))
+            print(f"[*] Verificação das fontes citadas: {resumo}.")
+            mortos = tally.get('quebrado', 0) + tally.get('indisponivel', 0)
+            if mortos:
+                print(f"[!] {mortos} fonte(s) não resolveram e aparecem marcadas no relatório. "
+                      "Substitua por URLs conferidas antes de tratar o dossiê como auditável.",
+                      file=sys.stderr)
     if output_dir is None:
         home = str(Path.home())
         output_dir = os.path.join(home, ".dossie-politico")
@@ -1751,6 +2614,11 @@ def build_dossier_file(data: Dict[str, Any], output_dir: Optional[str] = None) -
     filename = f"{sanitize_filename(nome_politico)}.html"
     filepath = os.path.join(output_dir, filename)
     
+    if not data.get('links_transparencia'):
+        sys.path.insert(0, str(Path(__file__).parent.resolve()))
+        from fetch_tse_transparency import build_transparency_links
+        data['links_transparencia'] = build_transparency_links(nome_politico)
+    data.setdefault('revisoes_anteriores', read_previous_revisions(output_dir, filename))
     html_content = generate_dossier_html(data)
     
     with open(filepath, 'w', encoding='utf-8') as f:
@@ -1762,16 +2630,38 @@ def build_dossier_file(data: Dict[str, Any], output_dir: Optional[str] = None) -
     return filepath
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print("Uso: python3 generate_dossier_html.py <dossie_data.json> [output_dir]")
-        sys.exit(1)
-        
-    json_path = sys.argv[1]
-    out_dir = sys.argv[2] if len(sys.argv) > 2 else None
+    parser = argparse.ArgumentParser(description="Gera o dossiê HTML, atualiza o catálogo e abre o índice geral.")
+    parser.add_argument('json_path', nargs='?', help="Payload JSON completo do dossiê")
+    parser.add_argument('--remove', metavar='ARQUIVO.html',
+                        help="Retira uma pessoa do catálogo (retificação / direito de resposta)")
+    parser.add_argument('--apagar-html', action='store_true',
+                        help="Com --remove, apaga também o relatório individual")
+    parser.add_argument('output_dir', nargs='?', default=None, help="Diretório de saída (padrão: ~/.dossie-politico)")
+    parser.add_argument('--output-dir', dest='output_dir_flag', default=None, help="Mesma coisa, na forma de opção")
+    parser.add_argument('--no-open-index', action='store_true', help="Não abre o índice (somente testes/ambientes sem interface)")
+    parser.add_argument('--no-check-links', action='store_true', help="Não verifica se as URLs das fontes citadas resolvem")
+    args = parser.parse_args()
+    json_path = args.json_path
+    out_dir = args.output_dir_flag or args.output_dir or os.path.join(str(Path.home()), ".dossie-politico")
+
+    if args.remove:
+        if remove_dossier_entry(out_dir, args.remove, delete_html=args.apagar_html):
+            print(f"Entrada removida do catálogo: {args.remove}")
+        else:
+            print(f"Nada a remover: '{args.remove}' não está no catálogo.", file=sys.stderr)
+            raise SystemExit(1)
+        raise SystemExit(0)
+
+    if not json_path:
+        parser.error("informe o payload JSON ou use --remove ARQUIVO.html")
     
     with open(json_path, 'r', encoding='utf-8') as f:
         dossier_data = json.load(f)
         
-    generated_path = build_dossier_file(dossier_data, out_dir)
+    generated_path = build_dossier_file(dossier_data, out_dir, check_links=not args.no_check_links)
+    index_path = os.path.join(os.path.dirname(generated_path), 'index.html')
     print(f"Dossiê HTML gerado com sucesso em:\n{generated_path}")
-    print(f"Índice atualizado em:\n{os.path.join(os.path.dirname(generated_path), 'index.html')}")
+    print(f"Índice atualizado em:\n{index_path}")
+    if not args.no_open_index:
+        if open_index_file(index_path):
+            print("Índice aberto no navegador padrão.")

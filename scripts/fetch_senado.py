@@ -6,9 +6,16 @@ Fonte oficial: https://legis.senado.leg.br/dadosabertos/
 
 import sys
 import json
+import time
+import urllib.error
 import urllib.request
 import unicodedata
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
+
+sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.resolve()))
+from remuneracao_oficial import (  # noqa: E402
+    AUXILIOS_SENADOR, CEAPS_CONFERIR_EM, contexto_remuneracao, subsidio,
+)
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) PoliticoDossie/1.0',
@@ -20,42 +27,84 @@ def normalize(text: str) -> str:
         return ""
     return unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('utf-8').lower().strip()
 
-def http_get(url: str, timeout: int = 15) -> Optional[Dict[str, Any]]:
-    try:
-        req = urllib.request.Request(url, headers=HEADERS)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            if resp.status == 200:
-                return json.loads(resp.read().decode('utf-8'))
-    except Exception as e:
-        sys.stderr.write(f"[WARN] Falha ao consultar {url}: {e}\n")
+def http_get(url: str, timeout: int = 15, tentativas: int = 3) -> Optional[Dict[str, Any]]:
+    """As APIs da Camara e do Senado derrubam handshake com frequencia; uma falha unica nao e resposta."""
+    for tentativa in range(1, tentativas + 1):
+        try:
+            req = urllib.request.Request(url, headers=HEADERS)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    return json.loads(resp.read().decode('utf-8'))
+                return None
+        except urllib.error.HTTPError as e:
+            sys.stderr.write(f"[WARN] {e.code} ao consultar {url}\n")
+            return None
+        except Exception as e:
+            if tentativa == tentativas:
+                sys.stderr.write(f"[WARN] Falha ao consultar {url} apos {tentativas} tentativas: {e}\n")
+            else:
+                time.sleep(0.6 * tentativa)
     return None
 
-def fetch_senador_por_nome(nome: str) -> Optional[Dict[str, Any]]:
+def find_senadores(nome: str) -> List[Dict[str, Any]]:
+    """Todos os senadores em exercicio compativeis com o nome, sem escolher sozinho."""
     norm_query = normalize(nome)
     url_lista = "https://legis.senado.leg.br/dadosabertos/senador/lista/atual.json"
     data = http_get(url_lista)
     if not data or 'ListaParlamentarEmExercicio' not in data:
-        return None
-        
+        return []
+
     parlamentares = data['ListaParlamentarEmExercicio']['Parlamentares'].get('Parlamentar', [])
-    matched = None
+    hits = []
     for p in parlamentares:
         ident = p.get('IdentificacaoParlamentar', {})
         nome_p = normalize(ident.get('NomeParlamentar', ''))
         nome_c = normalize(ident.get('NomeCompletoParlamentar', ''))
         if norm_query in nome_p or norm_query in nome_c or all(part in nome_p or part in nome_c for part in norm_query.split()):
-            matched = p
-            break
-            
-    if not matched:
+            hits.append(p)
+    return hits
+
+
+def describe_candidates(hits: List[Dict[str, Any]]) -> str:
+    linhas = "\n".join(
+        "  --codigo {c}  {n} ({p}-{u})".format(
+            c=h.get('IdentificacaoParlamentar', {}).get('CodigoParlamentar'),
+            n=h.get('IdentificacaoParlamentar', {}).get('NomeParlamentar'),
+            p=h.get('IdentificacaoParlamentar', {}).get('SiglaPartidoParlamentar'),
+            u=h.get('IdentificacaoParlamentar', {}).get('UfParlamentar'),
+        )
+        for h in hits
+    )
+    return (
+        f"Nome ambiguo no Senado: {len(hits)} correspondencias. "
+        f"Escolha explicitamente para nao gerar o dossie da pessoa errada:\n{linhas}"
+    )
+
+
+def fetch_senador_por_nome(nome: str, codigo_parlamentar: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    hits = find_senadores(nome)
+    if codigo_parlamentar is not None:
+        hits = [
+            h for h in hits
+            if str(h.get('IdentificacaoParlamentar', {}).get('CodigoParlamentar')) == str(codigo_parlamentar)
+        ] or [{'IdentificacaoParlamentar': {'CodigoParlamentar': str(codigo_parlamentar)}}]
+    if not hits:
         return None
+    if len(hits) > 1:
+        raise LookupError(describe_candidates(hits))
+    matched = hits[0]
 
     ident = matched.get('IdentificacaoParlamentar', {})
     mandato = matched.get('Mandato', {})
     codigo = ident.get('CodigoParlamentar')
     
-    # Detalhes completos
+    # Detalhes completos (tambem cobrem quem foi pedido por --codigo e nao esta na lista atual)
     det_data = http_get(f"https://legis.senado.leg.br/dadosabertos/senador/{codigo}.json")
+    det_parlamentar = (det_data or {}).get('DetalheParlamentar', {}).get('Parlamentar', {}) or {}
+    if not ident.get('NomeParlamentar'):
+        ident = det_parlamentar.get('IdentificacaoParlamentar', ident)
+    if not mandato:
+        mandato = det_parlamentar.get('MandatoAtual', {}) or {}
     
     # Matérias / Propostas
     materias_lista = []
@@ -103,13 +152,9 @@ def fetch_senador_por_nome(nome: str) -> Optional[Dict[str, Any]]:
                 'nome': s.get('NomeParlamentar')
             } for s in suplentes
         ],
-        'salario_oficial_base': 'R$ 44.008,52 (Subsidio Senador - Decreto Legislativo 172/2022)',
-        'auxilios_previstos': [
-            'Cota para o Exercício da Atividade Parlamentar dos Senadores (CEAPS - R$ 15.000 a R$ 44.000/mês)',
-            'Verba de Gabinete (R$ 118.800+/mês para contratação de assessores)',
-            'Auxílio-moradia (R$ 5.500,00) ou Apartamento Funcional em Brasília',
-            'Plano de Saúde vitalício / Reembolso integral de despesas médicas hospitalares'
-        ],
+        'salario_oficial_base': subsidio('Senador(a) da República'),
+        'salario_contexto': contexto_remuneracao(CEAPS_CONFERIR_EM),
+        'auxilios_previstos': list(AUXILIOS_SENADOR),
         'proposicoes_principais': [
             {
                 'id': m.get('Materia', {}).get('Codigo') or m.get('Materia', {}).get('CodigoMateria'),
@@ -131,8 +176,18 @@ if __name__ == '__main__':
         print(json.dumps({'error': 'Informe o nome do senador: python3 fetch_senado.py "<Nome>"'}))
         sys.exit(1)
     
-    nome_arg = " ".join(sys.argv[1:])
-    resultado = fetch_senador_por_nome(nome_arg)
+    argv = sys.argv[1:]
+    codigo = None
+    if '--codigo' in argv:
+        i = argv.index('--codigo')
+        codigo = argv[i + 1]
+        argv = argv[:i] + argv[i + 2:]
+    nome_arg = " ".join(argv)
+    try:
+        resultado = fetch_senador_por_nome(nome_arg, codigo)
+    except LookupError as exc:
+        print(json.dumps({'status': 'ambiguous', 'message': str(exc)}, ensure_ascii=False))
+        sys.exit(2)
     if resultado:
         print(json.dumps(resultado, indent=2, ensure_ascii=False))
     else:

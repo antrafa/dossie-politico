@@ -45,6 +45,17 @@ Este documento reúne os principais endpoints de APIs oficiais, portais de dados
   - `GET https://divulgacandcontas.tse.jus.br/divulga/rest/v1/eleicao/eleicoes`
   - `GET https://divulgacandcontas.tse.jus.br/divulga/rest/v1/candidatura/buscar/{ano}/{idEleicao}/candidatos`
 
+### Portal de Dados Abertos do TSE
+
+- **Catálogo por ano**: `https://dadosabertos.tse.jus.br/dataset/candidatos-{ano}`
+- **Cadastro nacional**: `https://cdn.tse.jus.br/estatistica/sead/odsele/consulta_cand/consulta_cand_{ano}.zip`
+- **Situação de julgamento**: `https://cdn.tse.jus.br/estatistica/sead/odsele/consulta_cand_complementar/consulta_cand_complementar_{ano}.zip`
+- Nos CSVs, filtre `DS_CARGO = PRESIDENTE` para a disputa presidencial e associe os arquivos por `SQ_CANDIDATO`.
+- Registre `DT_GERACAO` e `HH_GERACAO`: o cadastro muda durante o julgamento e pode receber substituições.
+- Para o status, prefira `DS_SITUACAO_JULGAMENTO` do arquivo complementar. Valores como “AGUARDANDO JULGAMENTO” indicam pedido de registro, não deferimento.
+
+Se a API REST ou o CDN negar acesso, consulte a interface do DivulgaCandContas e cruze a lista com uma publicação recente do TSE. Uma cópia ou espelho de terceiros pode ajudar na extração, mas nunca deve ser apresentado como fonte de autoridade e precisa ser conferido contra o catálogo oficial.
+
 ---
 
 ## 3. Poder Executivo e Governo Federal (CGU / Portal da Transparência)
@@ -109,3 +120,18 @@ Para levantar escândalos, notícias, investigações da Polícia Federal e do M
 # Desfechos e Decisões Judiciais (Garantia do contraditório)
 "<Nome do Político>" AND ("arquivado" OR "absolvido" OR "defesa alega" OR "inocentado" OR "prescrito" OR "rejeitada a denúncia")
 ```
+
+---
+
+## 7. Auditoria mínima de cobertura
+
+Esta lista é a porta de saída da pesquisa. Registre o resultado no campo `cobertura_pesquisa`; não trate um dossiê como completo sem percorrê-la.
+
+1. **Identidade e período**: pesquise nome civil, nome eleitoral, abreviações, apelidos públicos e grafias recorrentes. Cubra o ano corrente, os cinco anos anteriores e fatos antigos ainda com efeito jurídico ou político atual.
+2. **Órgãos e classes de fato**: verifique PF, MPF/MPE, CGU, TCU/TCE, STF, STJ, tribunal local, TSE/TRE e Conselho de Ética aplicável. Pesquise também gastos, emendas, patrimônio, campanha, conflitos de interesse, desinformação checada e decisões eleitorais.
+3. **Segunda passagem por vínculos descobertos**: para cada empresa, financiador, operador, instituto, ONG ou pessoa relevante que surgir, combine o nome dela com o nome do político. Inclua apenas vínculos de interesse público sustentados por documentos ou jornalismo profissional; não investigue relações pessoais sem nexo público.
+4. **Atualização e desfecho**: para cada ocorrência, busque decisão, arquivamento, denúncia, absolvição, condenação, recurso, situação processual e manifestação da defesa até a data de corte.
+5. **Triangulação**: dê preferência a documento ou portal oficial e use jornalismo profissional para contexto. Uma única reportagem pode revelar um fato, mas alegações contestadas exigem busca adicional e linguagem proporcional à evidência.
+6. **Registro visível**: informe data da busca, período, variações de nome, eixos e portais consultados, além de limitações concretas (sigilo, instabilidade do portal, documento não localizado ou ausência de dados consolidados).
+
+A auditoria reduz omissões, mas não autoriza afirmar exaustividade absoluta. O relatório deve dizer “nenhum caso localizado no recorte e nas fontes consultadas”, nunca “não existem outros casos”.
